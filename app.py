@@ -20,6 +20,16 @@ st.title("CSV Chat with Local LLM (LM Studio)")
 
 
 # ------------------------
+# LLM Defaults (avoid re-specifying each call)
+# ------------------------
+LM_ENDPOINT_DEFAULT = "http://localhost:1234"
+LM_MODEL_DEFAULT = "openai/gpt-oss-20b"
+LM_TEMPERATURE_DEFAULT = 0.7
+LM_MAX_TOKENS_DEFAULT = -1
+LM_STREAM_DEFAULT = False
+
+
+# ------------------------
 # Session State Init
 # ------------------------
 if "df" not in st.session_state:
@@ -32,6 +42,8 @@ if "column_info" not in st.session_state:
     st.session_state.column_info = None
 if "last_code" not in st.session_state:
     st.session_state.last_code = ""
+if "http_session" not in st.session_state:
+    st.session_state.http_session = requests.Session()
 
 
 # ------------------------
@@ -89,7 +101,18 @@ def build_prompt(user_question: str, column_info: Dict[str, str], sample_rows: L
 # ------------------------
 # LLM Client
 # ------------------------
-def query_llm(prompt: str, endpoint: str, model: str, temperature: float = 0.1, max_tokens: int = 800) -> str:
+def query_llm(
+    prompt: str,
+    endpoint: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    # Use stable defaults so we don't "reload" configs repeatedly
+    endpoint = endpoint or LM_ENDPOINT_DEFAULT
+    model = model or LM_MODEL_DEFAULT
+    temperature = LM_TEMPERATURE_DEFAULT if temperature is None else temperature
+    max_tokens = LM_MAX_TOKENS_DEFAULT if max_tokens is None else max_tokens
     payload = {
         "model": model,
         "messages": [
@@ -98,10 +121,45 @@ def query_llm(prompt: str, endpoint: str, model: str, temperature: float = 0.1, 
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stream": False,
+        "stream": LM_STREAM_DEFAULT,
     }
     try:
-        resp = requests.post(
+        resp = st.session_state.http_session.post(
+            f"{endpoint.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return content or ""
+    except Exception as e:
+        return f"ERROR_CALLING_LLM: {e}"
+
+
+def query_llm_text(
+    prompt: str,
+    endpoint: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    endpoint = endpoint or LM_ENDPOINT_DEFAULT
+    model = model or LM_MODEL_DEFAULT
+    temperature = LM_TEMPERATURE_DEFAULT if temperature is None else temperature
+    max_tokens = LM_MAX_TOKENS_DEFAULT if max_tokens is None else max_tokens
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful data analyst. Return concise markdown insights. Do not return code blocks."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": LM_STREAM_DEFAULT,
+    }
+    try:
+        resp = st.session_state.http_session.post(
             f"{endpoint.rstrip('/')}/v1/chat/completions",
             json=payload,
             timeout=120,
@@ -138,7 +196,7 @@ def execute_user_code(
     code: str,
     df: pd.DataFrame,
     extra_globals: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Dict[str, Any]]:
     # Restricted globals; provide common analysis libs
     sandbox_globals: Dict[str, Any] = {
         "__builtins__": {
@@ -173,10 +231,10 @@ def execute_user_code(
         std_out = stdout_buffer.getvalue()
         std_err = stderr_buffer.getvalue()
         combined = (std_out + ("\n" + std_err if std_err else "")).strip()
-        return True, combined
+        return True, combined, sandbox_globals
     except Exception:
         tb = traceback.format_exc()
-        return False, tb
+        return False, tb, sandbox_globals
     finally:
         stdout_buffer.close()
         stderr_buffer.close()
@@ -187,9 +245,9 @@ def execute_user_code(
 # ------------------------
 with st.sidebar:
     st.header("LLM Settings")
-    endpoint = st.text_input("LM Studio Endpoint", value="http://localhost:1234")
-    model = st.text_input("Model", value="gpt-oss-20b")
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
+    endpoint = st.text_input("LM Studio Endpoint", value=LM_ENDPOINT_DEFAULT)
+    model = st.text_input("Model", value=LM_MODEL_DEFAULT)
+    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=float(LM_TEMPERATURE_DEFAULT), step=0.05)
     st.markdown("Enter the local LM Studio endpoint and model name.")
 
 
@@ -255,31 +313,20 @@ if run_button:
                 attempt = 0
                 success = False
                 last_error = ""
+                last_env: Dict[str, Any] = {}
 
                 while attempt < max_retries and not success:
                     attempt += 1
                     with st.spinner(f"Executing generated code (attempt {attempt}/{max_retries})..."):
-                        ok, output = execute_user_code(code, df)
+                        ok, output, env_after = execute_user_code(code, df)
+                        last_env = env_after or {}
                         if ok:
                             success = True
                             if output:
                                 with st.expander("Program output (stdout/stderr)"):
                                     st.code(output)
-                            # Optional auto chart: if last object is a numeric Series/DataFrame, st.bar_chart can render
-                            try:
-                                # Heuristic: try common variable names used by LLMs
-                                possible_vars = ["result", "results", "out", "output"]
-                                for var_name in possible_vars:
-                                    if var_name in globals():
-                                        # Skip globals space; we executed in sandbox_globals only
-                                        continue
-                                # No direct access to sandbox locals here; rely on user code using st.* to display
-                                pass
-                            except Exception:
-                                pass
                         else:
                             last_error = output
-                            # Ask LLM to correct code using the error message
                             repair_prompt = (
                                 "Your previous code raised an exception. Here is the code and the error. "
                                 "Return corrected Python code only in one fenced code block. Do not explain.\n\n"
@@ -294,10 +341,81 @@ if run_button:
                             else:
                                 break
 
-                if not success:
+                table_obj = None
+                if success:
+                    # Try to locate a DataFrame/Series result to ensure visualization even if LLM forgot to use st.*
+                    preferred_keys = ["result", "results", "out", "output", "table", "data"]
+                    for key in preferred_keys:
+                        obj = last_env.get(key)
+                        if isinstance(obj, (pd.DataFrame, pd.Series)):
+                            table_obj = obj
+                            break
+                    if table_obj is None:
+                        for key, obj in list(last_env.items()):
+                            if key == "df":
+                                continue
+                            if isinstance(obj, (pd.DataFrame, pd.Series)):
+                                table_obj = obj
+                                break
+
+                    if table_obj is not None:
+                        if isinstance(table_obj, pd.Series):
+                            table_df = table_obj.to_frame(name=table_obj.name or "value")
+                        else:
+                            table_df = table_obj
+                        st.subheader("Visualization Result")
+                        st.dataframe(table_df.head(50))
+                        # Simple auto bar chart if small and mostly numeric
+                        try:
+                            if table_df.shape[0] <= 50 and table_df.select_dtypes(include=[np.number]).shape[1] >= 1:
+                                st.bar_chart(table_df.select_dtypes(include=[np.number]).head(50))
+                        except Exception:
+                            pass
+                else:
                     st.error("Failed to execute generated code after retries.")
                     with st.expander("Last error"):
                         st.code(last_error)
+
+                # Always produce insights: use table result if available, else fall back to CSV preview
+                try:
+                    if success and table_obj is not None:
+                        if isinstance(table_obj, pd.Series):
+                            table_df = table_obj.to_frame(name=table_obj.name or "value")
+                        else:
+                            table_df = table_obj
+                        preview_rows = min(10, len(table_df))
+                        table_preview = table_df.head(preview_rows)
+                        try:
+                            preview_json = table_preview.reset_index().to_json(orient="records")
+                        except Exception:
+                            preview_json = json.dumps([], ensure_ascii=False)
+                    else:
+                        # Fallback to CSV preview
+                        fallback_df = df.head(10)
+                        try:
+                            preview_json = fallback_df.reset_index().to_json(orient="records")
+                        except Exception:
+                            preview_json = json.dumps([], ensure_ascii=False)
+
+                    insights_prompt = (
+                        "Based on the user's question and the tabular preview, write concise insights, likely causes, "
+                        "and suggested next steps in markdown. Do not return code.\n\n"
+                        f"User question: {question}\n\n"
+                        f"Schema (column: dtype):\n" + "\n".join([f"- {c}: {t}" for c, t in (column_info or {}).items()]) + "\n\n"
+                        f"Tabular preview (JSON, with index if present):\n{preview_json}\n\n"
+                        "Structure with short sections: Insights, Possible Causes, Suggested Actions."
+                    )
+                    insights_text = query_llm_text(
+                        insights_prompt,
+                        endpoint=endpoint,
+                        model=model,
+                        temperature=max(0.2, float(temperature)),
+                        max_tokens=800,
+                    )
+                    st.subheader("Insights")
+                    st.markdown(insights_text)
+                except Exception:
+                    pass
 
                 if show_code and st.session_state.last_code:
                     with st.expander("Generated code"):
